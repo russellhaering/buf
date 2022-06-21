@@ -16,7 +16,11 @@ package pluginpush
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"os"
 
 	"github.com/bufbuild/buf/private/buf/bufcli"
 	"github.com/bufbuild/buf/private/bufpkg/bufanalysis"
@@ -24,10 +28,11 @@ import (
 	"github.com/bufbuild/buf/private/bufpkg/bufplugin/bufpluginsource"
 	"github.com/bufbuild/buf/private/pkg/app/appcmd"
 	"github.com/bufbuild/buf/private/pkg/app/appflag"
-	"github.com/bufbuild/buf/private/pkg/storage"
+	"github.com/bufbuild/buf/private/pkg/docker"
 	"github.com/bufbuild/buf/private/pkg/stringutil"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"go.uber.org/zap"
 )
 
 const (
@@ -108,13 +113,59 @@ func run(
 	}
 	// TODO: Once we support multiple plugin source types, this could be abstracted away
 	// in the bufpluginsource package. This is much simpler for now though.
-	pluginSourceFilePath, err := storage.Exists(ctx, sourceBucket, bufpluginsource.DockerSourceFilePath)
+	dockerfileInfo, err := sourceBucket.Get(ctx, bufpluginsource.DockerSourceFilePath)
 	if err != nil {
-		return bufcli.NewInternalError(err)
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("please define a %s plugin source file in the target directory", bufpluginsource.DockerSourceFilePath)
+		}
+		return err
 	}
-	if !pluginSourceFilePath {
-		return fmt.Errorf("please define a %s plugin source file in the target directory", bufpluginsource.DockerSourceFilePath)
+	defer dockerfileInfo.Close()
+
+	dockerClient, err := docker.NewClient(
+		// TODO: Currently unused
+		"http://localhost",
+		docker.WithHTTPClient(&http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					// TODO: We need to configure the path to Docker socket
+					return net.Dial("unix", "/var/run/docker.sock")
+				},
+			},
+		}),
+		docker.WithLogger(container.Logger()),
+	)
+	if err != nil {
+		return err
 	}
+	dockerContext, err := docker.CreateDockerContext(dockerfileInfo)
+	if err != nil {
+		return err
+	}
+	_, err = dockerClient.Image().Build(ctx, dockerContext, docker.ImageBuildParams{
+		Tags:     []string{pluginConfig.Name.IdentityString()}, // TODO: Uses version latest for now,
+		Platform: "linux/amd64",
+		Version:  "2", // DOCKER_BUILDKIT=1
+	})
+	if err != nil {
+		return err
+	}
+
+	imageInfo, err := dockerClient.Image().Inspect(ctx, pluginConfig.Name.IdentityString(), docker.ImageInspectParams{})
+	if err != nil {
+		return err
+	}
+	container.Logger().Info("created image",
+		zap.String("id", imageInfo.ID),
+		zap.Strings("tags", imageInfo.RepoTags),
+		zap.Strings("digests", imageInfo.RepoDigests),
+	)
+
+	_, err = dockerClient.Image().Push(ctx, pluginConfig.Name.IdentityString(), docker.ImagePushParams{})
+	if err != nil {
+		return err
+	}
+
 	// TODO: Build and push the image to the OCI registry with the Docker library.
 	// Once complete, use the digest in RPC below.
 	//
